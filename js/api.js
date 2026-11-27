@@ -92,6 +92,28 @@ const API = (() => {
         return vision === null ? model : { ...model, vision };
     }
 
+    // Keep the configured default model reachable even if the endpoint's
+    // model list no longer contains it (renamed/retired snapshot, filtered
+    // list, ...). Used by every adapter that loads models live.
+    function withConfiguredDefault(models, configuredModel) {
+        if (configuredModel && !models.some(m => m.id === configuredModel)) {
+            models.unshift({ id: configuredModel, name: configuredModel });
+        }
+        return models;
+    }
+
+    // Anthropic's /models response carries no modality metadata, so the
+    // capability is derived from the model generation: every Claude from
+    // generation 3 on accepts image input, Claude 1/2 does not. Returns null
+    // for ids we don't recognise, letting the client heuristics decide.
+    function anthropicVision(id) {
+        const s = String(id).toLowerCase();
+        if (!s.includes('claude')) return null;
+        if (/^claude-[3456789](\D|$)/.test(s) || /-[3456789]-\d/.test(s)) return true;  // claude-3-…, claude-sonnet-4-…, claude-haiku-4-5-…
+        if (/^claude-(instant|[12])(\D|$)/.test(s)) return false;                        // pre-vision models
+        return null;
+    }
+
     // --- OpenAI-compatible file parts (text + images) ---
     // Shared by the OpenAI and Custom adapters, both of which speak the
     // { type: 'text' | 'image_url' } content format. The message's own text
@@ -311,6 +333,68 @@ const API = (() => {
                 }
             }
         },
+
+        // Live model list from GET {baseUrl}/v1/models. The response is
+        // paginated with an `after_id` cursor, so follow it for a few pages
+        // and deduplicate. Like Custom, opts.strict (used by
+        // TEST_CONNECTION) turns missing credentials/fetch/HTTP failures into
+        // a real error instead of the static fallback list.
+        async listModels(settings, opts = {}) {
+            const strict = !!opts.strict;
+            const apiKey = settings.providers?.anthropic?.apiKey;
+            const baseUrl = (settings.providers?.anthropic?.baseUrl || 'https://api.anthropic.com').replace(/\/+$/, '');
+            // The saved model (only meaningful when Anthropic is the
+            // selected provider) must stay reachable in the dropdown.
+            const configuredModel = settings.defaultProvider === 'anthropic'
+                ? (settings.defaultModel || '').trim()
+                : '';
+
+            if (!apiKey) {
+                if (strict) throw new Error('Anthropic: API key is required. Configure it in Settings.');
+                return PROVIDER_MODELS.anthropic;
+            }
+
+            const headers = {
+                'x-api-key': apiKey,
+                'anthropic-version': '2023-06-01',
+                'anthropic-dangerous-direct-browser-access': 'true',
+            };
+
+            try {
+                const models = [];
+                let url = `${baseUrl}/v1/models?limit=1000`;
+
+                for (let page = 0; page < 5 && url; page++) {
+                    const resp = await fetch(url, { headers });
+                    if (!resp.ok) {
+                        if (strict) throw new Error(`Anthropic: GET /v1/models failed (${resp.status} ${resp.statusText})`);
+                        break;
+                    }
+
+                    const data = await resp.json();
+                    for (const m of data.data || []) {
+                        const id = m?.id;
+                        if (!id || models.some(x => x.id === id)) continue;
+                        const vision = anthropicVision(id);
+                        models.push({ id, name: m.display_name || id, ...(vision === null ? {} : { vision }) });
+                    }
+
+                    url = data.has_more && data.last_id
+                        ? `${baseUrl}/v1/models?limit=1000&after_id=${encodeURIComponent(data.last_id)}`
+                        : null;
+                }
+
+                if (models.length) {
+                    return withConfiguredDefault(
+                        models.sort((a, b) => a.name.localeCompare(b.name)),
+                        configuredModel
+                    );
+                }
+            } catch (e) {
+                if (strict) throw e; // surface the real error to the caller
+            }
+            return PROVIDER_MODELS.anthropic;
+        },
     };
 
     // --- Google Gemini Adapter ---
@@ -405,6 +489,65 @@ const API = (() => {
                     } catch (e) { /* skip */ }
                 }
             }
+        },
+
+        // Live model list from GET /v1beta/models. Only models that support
+        // generateContent are chat-usable, which drops embedding/aqa/imagen
+        // entries. The API carries no image-input metadata, so `vision` is
+        // left for the client heuristics (Gemini family => images allowed).
+        // opts.strict (used by TEST_CONNECTION) reports missing credentials
+        // and fetch/HTTP failures instead of the static fallback list.
+        async listModels(settings, opts = {}) {
+            const strict = !!opts.strict;
+            const apiKey = settings.providers?.google?.apiKey;
+            const configuredModel = settings.defaultProvider === 'google'
+                ? (settings.defaultModel || '').trim()
+                : '';
+
+            if (!apiKey) {
+                if (strict) throw new Error('Google: API key is required. Configure it in Settings.');
+                return PROVIDER_MODELS.google;
+            }
+
+            try {
+                const models = [];
+                let pageToken = '';
+
+                // The list is paginated (default page size is small); follow
+                // the token for a few pages, which covers every model list
+                // Google returns for a single API key.
+                for (let page = 0; page < 5; page++) {
+                    const url = `https://generativelanguage.googleapis.com/v1beta/models`
+                        + `?key=${encodeURIComponent(apiKey)}${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ''}`;
+                    const resp = await fetch(url);
+                    if (!resp.ok) {
+                        if (strict) throw new Error(`Google: GET /v1beta/models failed (${resp.status} ${resp.statusText})`);
+                        break;
+                    }
+
+                    const data = await resp.json();
+                    for (const m of data.models || []) {
+                        if (!(m.supportedGenerationMethods || []).includes('generateContent')) continue; // drops embedding/aqa/imagen
+                        const id = String(m.name || '').replace(/^models\//, '');
+                        if (id && !models.some(x => x.id === id)) {
+                            models.push({ id, name: m.displayName || id });
+                        }
+                    }
+
+                    pageToken = data.nextPageToken || '';
+                    if (!pageToken) break;
+                }
+
+                if (models.length > 0) {
+                    return withConfiguredDefault(
+                        models.sort((a, b) => a.name.localeCompare(b.name)),
+                        configuredModel
+                    );
+                }
+            } catch (e) {
+                if (strict) throw e; // surface the real error to the caller
+            }
+            return PROVIDER_MODELS.google;
         },
     };
 
@@ -674,10 +817,7 @@ const API = (() => {
                     if (models.length > 0) {
                         // Keep the configured default reachable even if the
                         // endpoint doesn't list it.
-                        if (configuredModel && !models.some(m => m.id === configuredModel)) {
-                            models.unshift({ id: configuredModel, name: configuredModel });
-                        }
-                        return models;
+                        return withConfiguredDefault(models, configuredModel);
                     }
                 }
             } catch (e) {
