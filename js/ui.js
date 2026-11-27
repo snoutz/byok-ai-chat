@@ -260,7 +260,11 @@ const UI = (() => {
         }
     }
 
-    function populateModelSelect(select, providerName, models) {
+    // isVision: optional (modelId) => boolean. Models it returns true for get
+    // a 📷 marker, so image-input support is visible before picking a model
+    // (instead of only after the capture button flips). Without a predicate,
+    // the model's own `vision` flag is used when the endpoint advertised one.
+    function populateModelSelect(select, providerName, models, isVision) {
         if (!select) return;
         select.innerHTML = '';
 
@@ -275,7 +279,11 @@ const UI = (() => {
         for (const m of models) {
             const opt = document.createElement('option');
             opt.value = m.id;
-            opt.textContent = m.name;
+
+            const vision = typeof isVision === 'function' ? isVision(m.id) : m.vision === true;
+            opt.textContent = vision ? `${m.name} 📷` : m.name;
+            opt.title = vision ? 'Accepts image input' : '';
+
             select.appendChild(opt);
         }
     }

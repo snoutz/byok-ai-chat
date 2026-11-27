@@ -1831,7 +1831,10 @@ Use the above search results to inform your answer. Cite sources using [number] 
         if (seq !== modelSelectSeq) return models;
 
         currentModels = models;
-        UI.populateModelSelect(modelSelect, provider, models);
+        // Marker comes from the shared capability check (provider metadata
+        // first, then heuristics) so it always matches what updateVisionUI
+        // will decide for the selected model.
+        UI.populateModelSelect(modelSelect, provider, models, (id) => modelSupportsVision(provider, id));
 
         if (desired) {
             const has = Array.from(modelSelect.options).some(o => o.value === desired);
@@ -1875,7 +1878,7 @@ Use the above search results to inform your answer. Cite sources using [number] 
         if (currentConversationId) {
             Storage.updateConversation(currentConversationId, { provider, model });
         }
-        $('model-info').textContent = `${provider}/${model}`;
+        renderModelInfo();
 
         // Persist LLM choice across sessions
         settings.defaultProvider = provider;
@@ -1914,12 +1917,25 @@ Use the above search results to inform your answer. Cite sources using [number] 
             /minicpm-v/,
             /gpt-4o/, /gpt-4\.1/, /gpt-4-turbo/, /gpt-5/, /gpt-6/,
             /(^|[/_.:\-])o[134]([/_.:\-]|$)/,          // o1 / o3 / o4 families
-            /claude(-(3|4)|-sonnet-4|-opus-4)/,        // Claude 3+ and Claude 4
+            /claude-(3|4|5)/,                    // claude-3-…, claude-3-5-…
+            /-[345]-\d/,                         // claude-sonnet-4-2025…, claude-haiku-4-5-…
             /gemini/,
         ];
         if (VISION_PATTERNS.some(re => re.test(id))) return true;
 
         return false; // unknown → assume no image input
+    }
+
+    // Bottom info line: which provider/model is active and whether it takes
+    // image input, so the reason behind the disabled capture button is always
+    // visible without opening the dropdown.
+    function renderModelInfo() {
+        const info = $('model-info');
+        if (!info) return;
+        const provider = $('provider-select').value;
+        const model = $('model-select').value;
+        info.textContent = model ? `${provider}/${model}` : provider;
+        if (model) info.textContent += visionEnabled ? ' · 📷 images on' : ' · ✕ images off';
     }
 
     // Enables/disables the capture button and image attachment based on the
@@ -1928,6 +1944,7 @@ Use the above search results to inform your answer. Cite sources using [number] 
         const provider = $('provider-select').value;
         const model = $('model-select').value;
         visionEnabled = modelSupportsVision(provider, model);
+        renderModelInfo();
 
         const captureBtn = $('screenshot-btn');
         if (captureBtn) {
