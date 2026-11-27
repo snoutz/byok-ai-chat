@@ -15,6 +15,12 @@ const App = (() => {
     let attachedFiles = [];     // attached files (images + text)
     let streamPort = null;     // port for streaming communication with service worker
     let webSearchMode = 'off'; // web search mode: 'off' or 'on'
+    let currentModels = [];    // models currently listed for the selected provider
+    let visionEnabled = true;  // whether the selected model accepts image input
+    let modelSelectSeq = 0;    // guards against out-of-order model list loads
+
+    const FILE_ACCEPT_ALL = 'image/*,.txt,.md,.json,.csv,.py,.js,.html,.css,.xml,.yaml,.yml,.log,.pdf,.doc,.docx';
+    const FILE_ACCEPT_TEXT = '.txt,.md,.json,.csv,.py,.js,.html,.css,.xml,.yaml,.yml,.log,.pdf,.doc,.docx';
 
     // --- Service Worker Keep-Alive ---
     // The MV3 service worker is killed after ~30s of inactivity. While we wait
@@ -82,13 +88,10 @@ const App = (() => {
         updateWebSearchButton();
         updateWebSearchMenuActive();
 
-        // Populate provider/model dropdowns
+        // Populate provider/model dropdowns. updateModelSelect loads the live
+        // model list for the default provider and applies the saved model.
         UI.populateProviderSelect($('provider-select'), settings);
-        await updateModelSelect();
-
-        // Set default provider/model
-        if (settings.defaultProvider) $('provider-select').value = settings.defaultProvider;
-        if (settings.defaultModel) $('model-select').value = settings.defaultModel;
+        await updateModelSelect(settings.defaultModel);
 
         // Load conversations
         await loadConversationList();
@@ -126,10 +129,13 @@ const App = (() => {
 
         // Provider/model changes
         $('provider-select').addEventListener('change', async () => {
-            await updateModelSelect();
+            await updateModelSelect(); // reloads list, applies vision gating
             saveCurrentProviderModel();
         });
-        $('model-select').addEventListener('change', saveCurrentProviderModel);
+        $('model-select').addEventListener('change', () => {
+            saveCurrentProviderModel();
+            updateVisionUI();
+        });
 
         // Sidebar toggle
         $('sidebar-toggle-btn').addEventListener('click', toggleSidebar);
@@ -231,6 +237,10 @@ const App = (() => {
         const text = input.value.trim();
         if (!text && !screenshotData && !pageContext && attachedFiles.length === 0) return;
         if (isStreaming) return;
+        if (!visionEnabled && screenshotData) {
+            UI.toast('Cannot send — selected model does not support image input', 'error');
+            return;
+        }
 
         // Ensure we have a conversation
         if (!currentConversationId) {
@@ -1502,8 +1512,16 @@ Use the above search results to inform your answer. Cite sources using [number] 
         await loadConversationList();
 
         // Set provider/model from conversation
+        const providerChanged = convo.provider && convo.provider !== $('provider-select').value;
         if (convo.provider) $('provider-select').value = convo.provider;
-        if (convo.model) $('model-select').value = convo.model;
+        if (providerChanged) {
+            // Model list belongs to the previous provider — reload it for this
+            // conversation's provider and select the conversation's model.
+            await updateModelSelect(convo.model);
+        } else {
+            if (convo.model) $('model-select').value = convo.model;
+            updateVisionUI();
+        }
 
         // Restore web search mode from conversation (backward compat: old named modes -> 'on')
         webSearchMode = normalizeWebSearchMode(convo.webSearchMode ?? settings.webSearchMode, convo.webSearchEnabled ?? settings.webSearchEnabled);
@@ -1620,6 +1638,10 @@ Use the above search results to inform your answer. Cite sources using [number] 
 
     // --- Screenshot ---
     async function handleScreenshot() {
+        if (!visionEnabled) {
+            UI.toast('Capture disabled — the selected model does not support image input', 'error');
+            return;
+        }
         try {
             const response = await sendToBackground({ type: 'CAPTURE_SCREENSHOT' });
             if (response?.success) {
@@ -1655,6 +1677,7 @@ Use the above search results to inform your answer. Cite sources using [number] 
         const files = Array.from(e.target.files || []);
         if (!files.length) return;
 
+        let accepted = 0;
         for (const file of files) {
             if (file.size > 10 * 1024 * 1024) {
                 UI.toast(`${file.name} is too large (max 10MB)`, 'error');
@@ -1662,6 +1685,10 @@ Use the above search results to inform your answer. Cite sources using [number] 
             }
 
             if (file.type?.startsWith('image/')) {
+                if (!visionEnabled) {
+                    UI.toast(`${file.name} skipped — the selected model does not support image input`, 'error');
+                    continue;
+                }
                 // Read image as data URL
                 const reader = new FileReader();
                 reader.onload = () => {
@@ -1674,6 +1701,7 @@ Use the above search results to inform your answer. Cite sources using [number] 
                     renderAttachmentPreviews();
                 };
                 reader.readAsDataURL(file);
+                accepted++;
             } else {
                 // Read text-based file as text
                 const reader = new FileReader();
@@ -1687,10 +1715,13 @@ Use the above search results to inform your answer. Cite sources using [number] 
                     renderAttachmentPreviews();
                 };
                 reader.readAsText(file);
+                accepted++;
             }
         }
 
-        UI.toast(`${files.length} file${files.length > 1 ? 's' : ''} attached`, 'success');
+        if (accepted > 0) {
+            UI.toast(`${accepted} file${accepted > 1 ? 's' : ''} attached`, 'success');
+        }
 
         // Reset file input so the same file can be re-attached
         e.target.value = '';
@@ -1767,15 +1798,48 @@ Use the above search results to inform your answer. Cite sources using [number] 
     }
 
     // --- Provider/Model ---
-    async function updateModelSelect() {
+    // Loads the live model list for the selected provider (OpenAI and Custom
+    // both go through GET {baseUrl}/models), fills the dropdown, then applies
+    // vision gating for whatever model ends up selected.
+    async function updateModelSelect(preferredModel, settingsOverride) {
         const provider = $('provider-select').value;
         const modelSelect = $('model-select');
+        const seq = ++modelSelectSeq;
 
-        // Try to fetch live models from service worker
-        sendToBackground({ type: 'LIST_MODELS', provider, settings }).then((response) => {
-            const models = response?.success ? response.models : [];
-            UI.populateModelSelect(modelSelect, provider, models.length > 0 ? models : getDefaultModels(provider));
-        });
+        // Keep the previous selection (or the preferred model) across reloads.
+        const desired = (preferredModel !== undefined && preferredModel !== null)
+            ? preferredModel
+            : modelSelect.value;
+
+        modelSelect.innerHTML = '<option value="">Loading models…</option>';
+
+        let models = [];
+        try {
+            const response = await sendToBackground({
+                type: 'LIST_MODELS',
+                provider,
+                settings: settingsOverride || settings,
+            });
+            models = (response?.success && Array.isArray(response.models) && response.models.length)
+                ? response.models
+                : getDefaultModels(provider);
+        } catch (e) {
+            models = getDefaultModels(provider);
+        }
+
+        // A newer request superseded this one (user flipped providers fast).
+        if (seq !== modelSelectSeq) return models;
+
+        currentModels = models;
+        UI.populateModelSelect(modelSelect, provider, models);
+
+        if (desired) {
+            const has = Array.from(modelSelect.options).some(o => o.value === desired);
+            if (has) modelSelect.value = desired;
+        }
+
+        updateVisionUI();
+        return models;
     }
 
     function getDefaultModels(provider) {
@@ -1818,6 +1882,91 @@ Use the above search results to inform your answer. Cite sources using [number] 
         settings.defaultModel = model;
         Storage.saveSettings(settings);
         chrome.runtime.sendMessage({ type: 'SAVE_SETTINGS', settings });
+
+        // Re-evaluate image input gating for the newly selected model
+        updateVisionUI();
+    }
+
+    // --- Vision (image input) capability ---
+    // Priority: explicit capability from the provider's /models response,
+    // then model-name heuristics. Unknown models are treated as NOT
+    // vision-capable (strict), so the capture button stays off until we know.
+    function modelSupportsVision(provider, modelId) {
+        if (!modelId) return false;
+
+        const entry = currentModels.find(m => m.id === modelId);
+        if (entry && typeof entry.vision === 'boolean') return entry.vision;
+
+        const id = String(modelId).toLowerCase();
+
+        // Clearly text-only / non-image models — checked first so they win
+        // over the positive patterns below.
+        const TEXT_ONLY = /(embedding|whisper|tts|stt|audio|transcri|moderation|rerank|dall-?e|stable-?diffusion|sdxl|gpt-3\.5|gpt-35|davinci|o1-mini|o3-mini)/;
+        if (TEXT_ONLY.test(id)) return false;
+
+        const VISION_PATTERNS = [
+            /vision/,
+            /llava/,
+            /(^|[^a-z])vl([^a-z]|$)/,     // -vl-, qwen2.5-vl, glm... (hyphen/space delimited "vl")
+            /\dvl/,                        // qwen2.5vl:7b style
+            /vlm/,
+            /internvl/, /smolvlm/, /pixtral/, /fuyu/, /paligemma/, /moondream/, /glm-?4v/,
+            /minicpm-v/,
+            /gpt-4o/, /gpt-4\.1/, /gpt-4-turbo/, /gpt-5/, /gpt-6/,
+            /(^|[/_.:\-])o[134]([/_.:\-]|$)/,          // o1 / o3 / o4 families
+            /claude(-(3|4)|-sonnet-4|-opus-4)/,        // Claude 3+ and Claude 4
+            /gemini/,
+        ];
+        if (VISION_PATTERNS.some(re => re.test(id))) return true;
+
+        return false; // unknown → assume no image input
+    }
+
+    // Enables/disables the capture button and image attachment based on the
+    // selected model's vision capability.
+    function updateVisionUI() {
+        const provider = $('provider-select').value;
+        const model = $('model-select').value;
+        visionEnabled = modelSupportsVision(provider, model);
+
+        const captureBtn = $('screenshot-btn');
+        if (captureBtn) {
+            captureBtn.disabled = !visionEnabled;
+            captureBtn.title = visionEnabled
+                ? 'Capture screenshot'
+                : 'Capture screenshot (disabled — this model does not support image input)';
+        }
+
+        const attachBtn = $('attach-file-btn');
+        if (attachBtn) {
+            attachBtn.title = visionEnabled
+                ? 'Attach file'
+                : 'Attach file (text only — this model does not support image input)';
+        }
+
+        const fileInput = $('file-input');
+        if (fileInput) {
+            fileInput.accept = visionEnabled ? FILE_ACCEPT_ALL : FILE_ACCEPT_TEXT;
+        }
+
+        if (!visionEnabled) stripImageAttachments();
+    }
+
+    // Removes screenshot/attached images when the selected model can't take them.
+    function stripImageAttachments() {
+        let removed = 0;
+        if (screenshotData) {
+            screenshotData = null;
+            removed++;
+        }
+        const before = attachedFiles.length;
+        attachedFiles = attachedFiles.filter(f => !f.type?.startsWith('image/'));
+        removed += before - attachedFiles.length;
+
+        if (removed > 0) {
+            renderAttachmentPreviews();
+            UI.toast('Image attachment removed — selected model does not support image input', 'info');
+        }
     }
 
     // --- Settings ---
@@ -1854,7 +2003,7 @@ Use the above search results to inform your answer. Cite sources using [number] 
         UI.closeModal('settings-modal');
         UI.toast('Settings saved!', 'success');
 
-        // Refresh model list
+        // Refresh model list (keeps the current selection when it still exists)
         await updateModelSelect();
     }
 
@@ -1882,9 +2031,16 @@ Use the above search results to inform your answer. Cite sources using [number] 
 
         sendToBackground({ type: 'TEST_CONNECTION', provider, settings: currentSettings }).then((response) => {
             if (response?.success) {
-                btn.textContent = '✓ Connected';
+                const count = Array.isArray(response.models) ? response.models.length : 0;
+                btn.textContent = count ? `✓ ${count} model${count > 1 ? 's' : ''}` : '✓ Connected';
                 btn.classList.add('success');
-                UI.toast(`${provider} connected!`, 'success');
+                UI.toast(count ? `${provider} connected — ${count} models available!` : `${provider} connected!`, 'success');
+
+                // If this is the provider currently selected in the header,
+                // refresh the model dropdown with what the test just returned.
+                if (count && provider === $('provider-select').value) {
+                    updateModelSelect($('model-select').value, currentSettings);
+                }
             } else {
                 btn.textContent = '✗ Failed';
                 btn.classList.add('error');

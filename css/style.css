@@ -800,6 +800,17 @@ body {
     border-radius: var(--radius);
 }
 
+.btn-icon:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+    background: transparent !important;
+    color: var(--text-muted) !important;
+}
+
+.btn-icon:disabled:hover {
+    background: transparent;
+}
+
 .btn-icon svg {
     display: block;
 }

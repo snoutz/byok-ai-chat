@@ -49,6 +49,70 @@ const API = (() => {
         custom: [],
     };
 
+    // --- Vision Capability Detection (from provider metadata) ---
+    // GET /models on OpenAI-compatible endpoints usually says nothing about
+    // image support, but some routers (OpenRouter, Ollama, vLLM, LM Studio)
+    // advertise it. Returns true/false when the endpoint says something,
+    // null when the capability is unknown (caller decides the fallback).
+    function extractVisionCapability(m) {
+        if (!m || typeof m !== 'object') return null;
+
+        if (typeof m.vision === 'boolean') return m.vision;
+        if (typeof m.supports_images === 'boolean') return m.supports_images;
+        if (typeof m.image_input === 'boolean') return m.image_input;
+
+        const caps = m.capabilities || m.supported_modalities || m.modalities || m.supported_inputs;
+        if (Array.isArray(caps) && caps.length) {
+            return caps.some(c => /image|vision/i.test(String(c)));
+        }
+
+        const inputs = m.architecture?.input_modalities
+            || m.properties?.input_modalities
+            || m.inputs
+            || m.input_modalities;
+        if (Array.isArray(inputs) && inputs.length) {
+            return inputs.some(c => /image|vision/i.test(String(c)));
+        }
+
+        if (typeof m.modality === 'string' && m.modality.includes('->')) {
+            return /image|vision/i.test(m.modality); // e.g. "text+image->text"
+        }
+
+        const families = m.details?.families || m.families;
+        if (Array.isArray(families) && families.length) {
+            return families.some(f => /clip|mllama|llava|vision|qwen2vl|internvl/i.test(String(f)));
+        }
+
+        return null;
+    }
+
+    // Attach `vision` to a listed model only when the endpoint advertised it.
+    function withVision(model, meta) {
+        const vision = extractVisionCapability(meta);
+        return vision === null ? model : { ...model, vision };
+    }
+
+    // --- OpenAI-compatible file parts (text + images) ---
+    // Shared by the OpenAI and Custom adapters, both of which speak the
+    // { type: 'text' | 'image_url' } content format. The message's own text
+    // is kept as the first part so typed text is never dropped.
+    function processOpenAIFiles(files, messageText) {
+        const textFiles = files.filter(f => f.type?.startsWith('text/') || f.name?.match(/\.(txt|md|json|csv|py|js|html|css|xml|yaml|yml|log)$/i));
+        const imageFiles = files.filter(f => f.type?.startsWith('image/'));
+
+        const content = [];
+        if (messageText) content.push({ type: 'text', text: messageText });
+        for (const file of textFiles) {
+            content.push({ type: 'text', text: `--- File: ${file.name} ---\n${file.content}\n--- End of ${file.name} ---` });
+        }
+        for (const img of imageFiles) {
+            content.push({ type: 'image_url', image_url: { url: img.data, detail: 'auto' } });
+        }
+
+        if (content.length === 0) return {};
+        return { content };
+    }
+
     // --- Token Estimation (approximate) ---
     function estimateTokens(text) {
         if (!text) return 0;
@@ -83,7 +147,7 @@ const API = (() => {
                 messages: messages.map(m => ({
                     role: m.role,
                     content: m.content,
-                    ...(m.files?.length ? this._processFiles(m.files) : {}),
+                    ...(m.files?.length ? processOpenAIFiles(m.files, m.content) : {}),
                 })),
                 stream: true,
                 temperature: options.temperature ?? 0.7,
@@ -135,31 +199,8 @@ const API = (() => {
             }
         },
 
-        _processFiles(files) {
-            const content = [];
-            const textFiles = files.filter(f => f.type?.startsWith('text/') || f.name?.match(/\.(txt|md|json|csv|py|js|html|css|xml|yaml|yml|log)$/i));
-            const imageFiles = files.filter(f => f.type?.startsWith('image/'));
-
-            for (const file of textFiles) {
-                content.push({ type: 'text', text: `--- File: ${file.name} ---\n${file.content}\n--- End of ${file.name} ---` });
-            }
-
-            if (imageFiles.length > 0) {
-                for (const img of imageFiles) {
-                    content.push({
-                        type: 'image_url',
-                        image_url: { url: img.data, detail: 'auto' },
-                    });
-                }
-            }
-
-            if (content.length === 0) return {};
-            if (imageFiles.length > 0 || textFiles.length > 0) {
-                const textParts = textFiles.map(f => ({ type: 'text', text: `--- File: ${f.name} ---\n${f.content}\n--- End of ${f.name} ---` }));
-                const imageParts = imageFiles.map(f => ({ type: 'image_url', image_url: { url: f.data, detail: 'auto' } }));
-                return { content: [...textParts, ...imageParts] };
-            }
-            return {};
+        _processFiles(files, messageText) {
+            return processOpenAIFiles(files, messageText);
         },
 
         async listModels(settings) {
@@ -174,7 +215,7 @@ const API = (() => {
                     const data = await resp.json();
                     const models = data.data
                         .filter(m => m.id.includes('gpt') || m.id.includes('o1') || m.id.includes('o3') || m.id.includes('chat'))
-                        .map(m => ({ id: m.id, name: m.id }))
+                        .map(m => withVision({ id: m.id, name: m.id }, m))
                         .sort((a, b) => a.name.localeCompare(b.name));
                     return models.length > 0 ? models : PROVIDER_MODELS.openai;
                 }
@@ -441,7 +482,7 @@ const API = (() => {
                 if (resp.ok) {
                     const data = await resp.json();
                     if (data.models?.length) {
-                        return data.models.map(m => ({ id: m.name, name: m.name }));
+                        return data.models.map(m => withVision({ id: m.name, name: m.name }, m));
                     }
                 }
             } catch (e) { /* fallback */ }
@@ -513,7 +554,7 @@ const API = (() => {
                 if (resp.ok) {
                     const data = await resp.json();
                     if (data.data?.length) {
-                        return data.data.map(m => ({ id: m.id, name: m.id }));
+                        return data.data.map(m => withVision({ id: m.id, name: m.id }, m));
                     }
                 }
             } catch (e) { /* fallback */ }
@@ -522,11 +563,14 @@ const API = (() => {
     };
 
     // --- Custom API Adapter (OpenAI-compatible format) ---
+    // Behaves exactly like the OpenAI adapter: model comes from the model
+    // dropdown, images/text files are sent as OpenAI content parts, and the
+    // model list is loaded live from GET {baseUrl}/models.
     const CustomAdapter = {
         async *stream(messages, options, settings) {
             const apiKey = settings.providers?.custom?.apiKey || options.apiKey;
             const baseUrl = (settings.providers?.custom?.baseUrl || '').replace(/\/+$/, '');
-            const model = settings.providers?.custom?.model || options.model || 'custom-model';
+            const model = options.model || settings.providers?.custom?.model || 'custom-model';
 
             if (!baseUrl) {
                 throw new Error('Custom API: Base URL is required. Configure it in Settings.');
@@ -537,6 +581,7 @@ const API = (() => {
                 messages: messages.map(m => ({
                     role: m.role,
                     content: m.content,
+                    ...(m.files?.length ? processOpenAIFiles(m.files, m.content) : {}),
                 })),
                 stream: true,
                 temperature: options.temperature ?? 0.7,
@@ -587,6 +632,58 @@ const API = (() => {
                     } catch (e) { /* skip */ }
                 }
             }
+        },
+
+        // Load the model list exactly like the OpenAI adapter does:
+        // GET {baseUrl}/models, sorted, with the configured default model
+        // guaranteed to appear in the dropdown.
+        // opts.strict (used by TEST_CONNECTION) turns fetch/HTTP failures into
+        // a thrown error so "Test Connection" can honestly report failure;
+        // the dropdown path (no opts) always falls back gracefully.
+        async listModels(settings, opts = {}) {
+            const strict = !!opts.strict;
+            const apiKey = settings.providers?.custom?.apiKey;
+            const baseUrl = (settings.providers?.custom?.baseUrl || '').replace(/\/+$/, '');
+            const configuredModel = settings.providers?.custom?.model?.trim();
+            const fallback = configuredModel ? [{ id: configuredModel, name: configuredModel }] : [];
+
+            if (!baseUrl) {
+                if (strict) throw new Error('Custom API: Base URL is required. Configure it in Settings.');
+                return fallback;
+            }
+
+            try {
+                const headers = {};
+                if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+                const resp = await fetch(`${baseUrl}/models`, { headers });
+                if (!resp.ok) {
+                    if (strict) throw new Error(`Custom API: GET /models failed (${resp.status} ${resp.statusText})`);
+                } else {
+                    const data = await resp.json();
+                    const list = Array.isArray(data.data) ? data.data
+                        : Array.isArray(data.models) ? data.models
+                        : [];
+
+                    const models = list
+                        .map(m => m?.id || m?.name)
+                        .filter(Boolean)
+                        .map(id => withVision({ id, name: id }, list.find(m => (m.id || m.name) === id)))
+                        .sort((a, b) => a.name.localeCompare(b.name));
+
+                    if (models.length > 0) {
+                        // Keep the configured default reachable even if the
+                        // endpoint doesn't list it.
+                        if (configuredModel && !models.some(m => m.id === configuredModel)) {
+                            models.unshift({ id: configuredModel, name: configuredModel });
+                        }
+                        return models;
+                    }
+                }
+            } catch (e) {
+                if (strict) throw e; // surface the real error to the caller
+            }
+            return fallback;
         },
     };
 
@@ -648,7 +745,9 @@ const API = (() => {
             if (!provider) return { success: false, error: 'Unknown provider' };
 
             if (provider.listModels) {
-                const models = await provider.listModels(settings);
+                // strict: adapters that can (Custom) surface real fetch/HTTP
+                // errors instead of silently returning their fallback list.
+                const models = await provider.listModels(settings, { strict: true });
                 return { success: true, models };
             }
 
