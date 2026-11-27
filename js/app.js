@@ -8,7 +8,6 @@ const App = (() => {
     // --- State ---
     let currentConversationId = null;
     let isStreaming = false;
-    let abortController = null;
     let settings = {};
     let presets = [];
     let pageContext = null;   // attached page context
@@ -16,6 +15,43 @@ const App = (() => {
     let attachedFiles = [];     // attached files (images + text)
     let streamPort = null;     // port for streaming communication with service worker
     let webSearchMode = 'off'; // web search mode: 'off' or 'on'
+
+    // --- Service Worker Keep-Alive ---
+    // The MV3 service worker is killed after ~30s of inactivity. While we wait
+    // on the provider (or run web search) we ping the worker every 20s so it is
+    // never terminated mid-request ("Connection to service worker lost").
+    const KEEPALIVE_INTERVAL_MS = 20000;
+    let keepAliveRefs = 0;
+    let keepAliveTimer = null;
+
+    function startKeepAlive() {
+        keepAliveRefs++;
+        if (keepAliveTimer) return;
+        keepAliveTimer = setInterval(() => {
+            try {
+                // Receiving this message resets the worker's idle timer.
+                const p = chrome.runtime.sendMessage({ type: 'PING' });
+                if (p && typeof p.catch === 'function') p.catch(() => {});
+            } catch (e) { /* worker restarting; next tick retries */ }
+        }, KEEPALIVE_INTERVAL_MS);
+    }
+
+    function stopKeepAlive() {
+        keepAliveRefs = Math.max(0, keepAliveRefs - 1);
+        if (keepAliveRefs === 0 && keepAliveTimer) {
+            clearInterval(keepAliveTimer);
+            keepAliveTimer = null;
+        }
+    }
+
+    // Promise-style sendMessage that keeps the worker alive until the response
+    // arrives; resolves with { __runtimeError } instead of rejecting.
+    function sendToBackground(message) {
+        startKeepAlive();
+        return Promise.resolve(chrome.runtime.sendMessage(message))
+            .catch((err) => ({ __runtimeError: err?.message || String(err) }))
+            .finally(() => stopKeepAlive());
+    }
 
     // --- DOM References ---
     const $ = (id) => document.getElementById(id);
@@ -288,7 +324,7 @@ const App = (() => {
     // --- Start Streaming (normal, no search) ---
     function startStreaming(messages) {
         isStreaming = true;
-        abortController = new AbortController();
+        startKeepAlive();
         updateSendButton();
 
         // Add assistant message placeholder
@@ -313,8 +349,11 @@ const App = (() => {
         });
 
         streamPort.onDisconnect.addListener(() => {
+            // Fires when the worker stops or the panel closed the port. With the
+            // keep-alive heartbeat this should only happen on real worker
+            // termination — surface it, but keep any partial output.
             if (isStreaming) {
-                handleStreamError({ error: 'Connection to service worker lost.' });
+                handleStreamError({ error: 'Connection to service worker lost. Partial response kept — send the message again to retry.' });
             }
             streamPort = null;
         });
@@ -331,6 +370,18 @@ const App = (() => {
             },
             settings,
         });
+    }
+
+    // --- Stop Streaming ---
+    // Tells the service worker to abort the in-flight fetch, then finalizes
+    // the message with whatever content was already received.
+    function stopStreaming() {
+        if (streamPort) {
+            try { streamPort.postMessage({ type: 'ABORT_STREAM' }); } catch (e) {}
+            try { streamPort.disconnect(); } catch (e) {}
+            streamPort = null;
+        }
+        handleStreamDone({ content: streamingContent, aborted: true });
     }
 
     // --- Handle Send with Web Research (Search + Visit Loop) ---
@@ -923,10 +974,14 @@ Use the above search results to inform your answer. Cite sources using [number] 
             const port = chrome.runtime.connect({ name: 'ai-stream' });
             let fullContent = '';
             let settled = false;
+            let timeoutId = null;
+            startKeepAlive();
 
             const finish = (value) => {
                 if (settled) return;
                 settled = true;
+                if (timeoutId) clearTimeout(timeoutId);
+                stopKeepAlive();
                 try { port.disconnect(); } catch {}
                 resolve(value);
             };
@@ -963,7 +1018,7 @@ Use the above search results to inform your answer. Cite sources using [number] 
                 settings,
             });
 
-            setTimeout(() => finish(fullContent.trim() || ''), timeout);
+            timeoutId = setTimeout(() => finish(fullContent.trim() || ''), timeout);
         });
     }
 
@@ -984,16 +1039,13 @@ Use the above search results to inform your answer. Cite sources using [number] 
                 }
             }, 25000);
 
-            chrome.runtime.sendMessage({
-                type: 'WEB_SEARCH',
-                query,
-            }, (response) => {
+            sendToBackground({ type: 'WEB_SEARCH', query }).then((response) => {
                 if (settled) return;
                 settled = true;
                 clearTimeout(timeoutId);
 
-                if (chrome.runtime.lastError) {
-                    console.error('[WebSearch] Runtime error:', chrome.runtime.lastError.message);
+                if (response?.__runtimeError) {
+                    console.error('[WebSearch] Runtime error:', response.__runtimeError);
                     resolve(null);
                     return;
                 }
@@ -1022,17 +1074,17 @@ Use the above search results to inform your answer. Cite sources using [number] 
                 }
             }, 20000);
 
-            chrome.runtime.sendMessage({
+            sendToBackground({
                 type: 'VISIT_WEBSITE',
                 url,
                 maxTextLength: 6000,
-            }, (response) => {
+            }).then((response) => {
                 if (settled) return;
                 settled = true;
                 clearTimeout(timeoutId);
 
-                if (chrome.runtime.lastError) {
-                    console.error('[WebSearch] Visit runtime error:', chrome.runtime.lastError.message);
+                if (response?.__runtimeError) {
+                    console.error('[WebSearch] Visit runtime error:', response.__runtimeError);
                     resolve(null);
                     return;
                 }
@@ -1254,7 +1306,7 @@ Use the above search results to inform your answer. Cite sources using [number] 
 
     async function handleStreamDone(message) {
         isStreaming = false;
-        abortController = null;
+        stopKeepAlive();
         updateSendButton();
 
         // Close the streaming port
@@ -1275,15 +1327,23 @@ Use the above search results to inform your answer. Cite sources using [number] 
         streamingContent = '';
     }
 
-    function handleStreamError(message) {
+    async function handleStreamError(message) {
         isStreaming = false;
-        abortController = null;
+        stopKeepAlive();
         updateSendButton();
 
         // Close the streaming port
         if (streamPort) {
-            streamPort.disconnect();
+            try { streamPort.disconnect(); } catch (e) {}
             streamPort = null;
+        }
+
+        // Persist any partial response received before the failure
+        if (currentConversationId && streamingContent) {
+            await Storage.addMessage(currentConversationId, {
+                role: 'assistant',
+                content: streamingContent,
+            });
         }
 
         // Show error message
@@ -1378,13 +1438,13 @@ Use the above search results to inform your answer. Cite sources using [number] 
             const model = $('model-select').value;
             const titleMessages = [{ role: 'user', content: buildTitleSeed(firstMessage) }];
 
-            chrome.runtime.sendMessage({
+            sendToBackground({
                 type: 'GENERATE_TITLE',
                 messages: titleMessages,
                 provider,
                 model,
                 settings,
-            }, async (response) => {
+            }).then(async (response) => {
                 const title = cleanGeneratedTitle(response?.title);
                 if (!response?.success || !title || title.toLowerCase() === 'new chat') return;
 
@@ -1561,15 +1621,14 @@ Use the above search results to inform your answer. Cite sources using [number] 
     // --- Screenshot ---
     async function handleScreenshot() {
         try {
-            chrome.runtime.sendMessage({ type: 'CAPTURE_SCREENSHOT' }, (response) => {
-                if (response?.success) {
-                    screenshotData = response.dataUrl;
-                    renderAttachmentPreviews();
-                    UI.toast('Screenshot captured!', 'success');
-                } else {
-                    UI.toast(response?.error || 'Failed to capture screenshot', 'error');
-                }
-            });
+            const response = await sendToBackground({ type: 'CAPTURE_SCREENSHOT' });
+            if (response?.success) {
+                screenshotData = response.dataUrl;
+                renderAttachmentPreviews();
+                UI.toast('Screenshot captured!', 'success');
+            } else {
+                UI.toast(response?.error || response?.__runtimeError || 'Failed to capture screenshot', 'error');
+            }
         } catch (e) {
             UI.toast('Failed to capture screenshot', 'error');
         }
@@ -1578,15 +1637,14 @@ Use the above search results to inform your answer. Cite sources using [number] 
     // --- Page Context ---
     async function handlePageContext() {
         try {
-            chrome.runtime.sendMessage({ type: 'GET_PAGE_CONTENT', maxTextLength: 4000 }, (response) => {
-                if (response?.success) {
-                    pageContext = response.context;
-                    renderAttachmentPreviews();
-                    UI.toast('Page context attached!', 'success');
-                } else {
-                    UI.toast(response?.error || 'Failed to get page context', 'error');
-                }
-            });
+            const response = await sendToBackground({ type: 'GET_PAGE_CONTENT', maxTextLength: 4000 });
+            if (response?.success) {
+                pageContext = response.context;
+                renderAttachmentPreviews();
+                UI.toast('Page context attached!', 'success');
+            } else {
+                UI.toast(response?.error || response?.__runtimeError || 'Failed to get page context', 'error');
+            }
         } catch (e) {
             UI.toast('Failed to get page context', 'error');
         }
@@ -1714,7 +1772,7 @@ Use the above search results to inform your answer. Cite sources using [number] 
         const modelSelect = $('model-select');
 
         // Try to fetch live models from service worker
-        chrome.runtime.sendMessage({ type: 'LIST_MODELS', provider, settings }, (response) => {
+        sendToBackground({ type: 'LIST_MODELS', provider, settings }).then((response) => {
             const models = response?.success ? response.models : [];
             UI.populateModelSelect(modelSelect, provider, models.length > 0 ? models : getDefaultModels(provider));
         });
@@ -1822,7 +1880,7 @@ Use the above search results to inform your answer. Cite sources using [number] 
             currentSettings.providers.custom = { apiKey: $('custom-apikey').value, baseUrl: $('custom-baseurl').value, model: $('custom-model').value };
         }
 
-        chrome.runtime.sendMessage({ type: 'TEST_CONNECTION', provider, settings: currentSettings }, (response) => {
+        sendToBackground({ type: 'TEST_CONNECTION', provider, settings: currentSettings }).then((response) => {
             if (response?.success) {
                 btn.textContent = '✓ Connected';
                 btn.classList.add('success');
@@ -1830,7 +1888,7 @@ Use the above search results to inform your answer. Cite sources using [number] 
             } else {
                 btn.textContent = '✗ Failed';
                 btn.classList.add('error');
-                UI.toast(response?.error || 'Connection failed', 'error');
+                UI.toast(response?.error || response?.__runtimeError || 'Connection failed', 'error');
             }
 
             setTimeout(() => {
@@ -1897,12 +1955,7 @@ Use the above search results to inform your answer. Cite sources using [number] 
             btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`;
             btn.className = 'btn btn-stop';
             btn.title = 'Stop generating';
-            btn.onclick = () => {
-                // Note: can't abort service worker fetch from side panel directly
-                // The stream will end on its own or we'd need a more complex abort mechanism
-                isStreaming = false;
-                updateSendButton();
-            };
+            btn.onclick = () => stopStreaming();
         } else {
             btn.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>`;
             btn.className = 'btn btn-send';
@@ -1966,9 +2019,9 @@ Use the above search results to inform your answer. Cite sources using [number] 
         btn.textContent = 'Testing...';
         btn.className = 'test-connection-btn';
 
-        chrome.runtime.sendMessage({
+        sendToBackground({
             type: 'WEB_SEARCH_TEST',
-        }, (response) => {
+        }).then((response) => {
             if (response?.ok) {
                 btn.textContent = '✓ Connected';
                 btn.classList.add('success');

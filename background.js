@@ -37,48 +37,85 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
     }
 });
 
+// --- Service Worker Keep-Alive ---
+// MV3 service workers are terminated after ~30 seconds of inactivity.
+// Long provider calls (reasoning models, local servers still loading a
+// model, multi-step web search) can easily exceed that, and when the worker
+// dies mid-request the side panel sees "Connection to service worker lost".
+// While any request is in flight we call an extension API on a short
+// interval, which resets the idle timer and keeps the worker alive.
+const KEEPALIVE_INTERVAL_MS = 20000;
+let keepAliveTimer = null;
+let activeRequests = 0;
+
+function startKeepAlive() {
+    activeRequests++;
+    if (keepAliveTimer) return;
+    keepAliveTimer = setInterval(() => {
+        // Any extension API call resets the service worker idle timer.
+        chrome.runtime.getPlatformInfo(() => {});
+    }, KEEPALIVE_INTERVAL_MS);
+}
+
+function stopKeepAlive() {
+    activeRequests = Math.max(0, activeRequests - 1);
+    if (activeRequests === 0 && keepAliveTimer) {
+        clearInterval(keepAliveTimer);
+        keepAliveTimer = null;
+    }
+}
+
+// Run a handler with the keep-alive heartbeat active until it responds.
+function runWithKeepAlive(fn, sendResponse) {
+    startKeepAlive();
+    Promise.resolve()
+        .then(fn)
+        .catch((err) => {
+            try { sendResponse({ success: false, ok: false, error: err?.message || String(err) }); } catch (e) { /* channel closed */ }
+        })
+        .finally(() => stopKeepAlive());
+    return true; // keep the message channel open for the async response
+}
+
 // --- Message Handler ---
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    // Heartbeat from the side panel. Receiving a message resets the worker's
+    // idle timer, so pings every <30s keep it alive during long operations.
+    if (message.type === 'PING') {
+        sendResponse({ ok: true });
+        return false;
+    }
+
     switch (message.type) {
         case 'CAPTURE_SCREENSHOT':
-            handleCaptureScreenshot(sender, sendResponse);
-            return true; // async
+            return runWithKeepAlive(() => handleCaptureScreenshot(sender, sendResponse), sendResponse);
 
         case 'GET_PAGE_CONTENT':
-            handleGetPageContent(message, sender, sendResponse);
-            return true; // async
+            return runWithKeepAlive(() => handleGetPageContent(message, sender, sendResponse), sendResponse);
 
         case 'LIST_MODELS':
-            handleListModels(message, sendResponse);
-            return true; // async
+            return runWithKeepAlive(() => handleListModels(message, sendResponse), sendResponse);
 
         case 'GENERATE_TITLE':
-            handleGenerateTitle(message, sendResponse);
-            return true; // async
+            return runWithKeepAlive(() => handleGenerateTitle(message, sendResponse), sendResponse);
 
         case 'TEST_CONNECTION':
-            handleTestConnection(message, sendResponse);
-            return true; // async
+            return runWithKeepAlive(() => handleTestConnection(message, sendResponse), sendResponse);
 
         case 'GET_SETTINGS':
-            handleGetSettings(sendResponse);
-            return true; // async
+            return runWithKeepAlive(() => handleGetSettings(sendResponse), sendResponse);
 
         case 'SAVE_SETTINGS':
-            handleSaveSettings(message, sendResponse);
-            return true; // async
+            return runWithKeepAlive(() => handleSaveSettings(message, sendResponse), sendResponse);
 
         case 'WEB_SEARCH':
-            handleWebSearch(message, sendResponse);
-            return true; // async
+            return runWithKeepAlive(() => handleWebSearch(message, sendResponse), sendResponse);
 
         case 'VISIT_WEBSITE':
-            handleVisitWebsite(message, sendResponse);
-            return true; // async
+            return runWithKeepAlive(() => handleVisitWebsite(message, sendResponse), sendResponse);
 
         case 'WEB_SEARCH_TEST':
-            handleWebSearchTest(sendResponse);
-            return true; // async
+            return runWithKeepAlive(() => handleWebSearchTest(sendResponse), sendResponse);
 
         default:
             return false;
@@ -88,59 +125,92 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // --- Port-based Streaming Handler ---
 // The side panel opens a port via chrome.runtime.connect() for streaming.
 // This is the ONLY reliable way to stream from service worker → side panel.
+// A keep-alive heartbeat runs for the whole stream so the service worker is
+// never terminated mid-generation ("Connection to service worker lost").
 chrome.runtime.onConnect.addListener((port) => {
     if (port.name !== 'ai-stream') return;
 
-    port.onMessage.addListener(async (message) => {
+    // Per-connection abort controller so the panel can stop generation
+    let abortController = null;
+
+    port.onMessage.addListener((message) => {
+        // Panel asked us to stop generating
+        if (message.type === 'ABORT_STREAM') {
+            try { abortController?.abort(); } catch (e) {}
+            return;
+        }
         if (message.type !== 'SEND_MESSAGE') return;
 
-        const { messages, options, settings } = message;
+        const { messages, settings } = message;
+        const options = { ...message.options };
+        abortController = new AbortController();
+        options.abortSignal = abortController.signal;
 
-        try {
-            const stream = API.sendMessage(messages, options, settings);
-            let fullContent = '';
+        startKeepAlive();
+        (async () => {
+            try {
+                const stream = API.sendMessage(messages, options, settings);
+                let fullContent = '';
 
-            for await (const chunk of stream) {
-                fullContent += chunk;
-                // Send streaming chunks back through the port
+                for await (const chunk of stream) {
+                    fullContent += chunk;
+                    // Send streaming chunks back through the port
+                    try {
+                        port.postMessage({
+                            type: 'STREAM_CHUNK',
+                            content: chunk,
+                            fullContent,
+                            provider: options.provider,
+                            model: options.model,
+                        });
+                    } catch (e) {
+                        // Port disconnected — panel was closed
+                        break;
+                    }
+                }
+
+                // Send completion signal
                 try {
                     port.postMessage({
-                        type: 'STREAM_CHUNK',
-                        content: chunk,
-                        fullContent,
+                        type: 'STREAM_DONE',
+                        content: fullContent,
+                        aborted: abortController.signal.aborted,
                         provider: options.provider,
                         model: options.model,
                     });
-                } catch (e) {
-                    // Port disconnected — panel was closed
-                    break;
+                } catch (e) { /* port closed */ }
+            } catch (error) {
+                if (error?.name === 'AbortError') {
+                    try {
+                        port.postMessage({
+                            type: 'STREAM_DONE',
+                            content: '',
+                            aborted: true,
+                            provider: options.provider,
+                            model: options.model,
+                        });
+                    } catch (e) { /* port closed */ }
+                } else {
+                    try {
+                        port.postMessage({
+                            type: 'STREAM_ERROR',
+                            error: error.message,
+                            provider: options.provider,
+                            model: options.model,
+                        });
+                    } catch (e) { /* port closed */ }
                 }
+            } finally {
+                abortController = null;
+                stopKeepAlive();
             }
-
-            // Send completion signal
-            try {
-                port.postMessage({
-                    type: 'STREAM_DONE',
-                    content: fullContent,
-                    provider: options.provider,
-                    model: options.model,
-                });
-            } catch (e) { /* port closed */ }
-        } catch (error) {
-            try {
-                port.postMessage({
-                    type: 'STREAM_ERROR',
-                    error: error.message,
-                    provider: options.provider,
-                    model: options.model,
-                });
-            } catch (e) { /* port closed */ }
-        }
+        })();
     });
 
-    // Clean up when port disconnects
+    // Clean up when the port disconnects (panel closed or stream stopped)
     port.onDisconnect.addListener(() => {
-        // Could abort any in-flight request here if needed
+        try { abortController?.abort(); } catch (e) {}
+        abortController = null;
     });
 });
 
